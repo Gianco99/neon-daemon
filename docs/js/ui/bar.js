@@ -2,13 +2,15 @@ import { h, replace, toast, errorToast, errorMessage, copyText } from "../lib/do
 import { keyProof, chatKey, lobbyCodeLabel, normalizeCode } from "../lib/crypto.js";
 import { keyring } from "../lib/store.js";
 import { fmtTime, fmtClock, PICKS } from "../lib/util.js";
-import { DRINKS } from "../looks.js";
+import { activeBuff, EARNING } from "../looks.js";
+import { openBarMenu, buffChip } from "./drinks.js";
 import { Stage } from "../scene/stage.js";
 import { LOUNGE } from "../scene/bar.js";
 import { brand, navigate, mePill, inviteLink, portrait, stateBadge } from "./common.js";
 import { userMenu, askForKey } from "./lobbies.js";
 import { friendsPanel } from "./friends.js";
 import { openLinkClaude } from "./link.js";
+import { openCustomize } from "./customize.js";
 import { openBets, bettable } from "./bets.js";
 import { openProfile } from "./profile.js";
 import { openJukebox, musicButton } from "./music.js";
@@ -77,7 +79,9 @@ export function renderBar(app, backend, { code }) {
     const meId = backend.user.id;
     const me = mePill(backend, userMenu(backend));
     const music = musicButton();
-    cleanup.push(me.destroy, music.destroy);
+    const buff = buffChip(backend, () => openDrinks());
+    cleanup.push(me.destroy, music.destroy, buff.destroy);
+    cleanup.push(backend.on("earned", (e) => toast(`+${e.amount} 🪙 ${e.label}`, "gold", 3600)));
     const peers = new Map();
     let known = new Map();
     let agents = [];
@@ -105,6 +109,7 @@ export function renderBar(app, backend, { code }) {
       lobby.is_private ? h("span", { class: "badge mint", title: "Chat is end-to-end encrypted with this bar's key" }, "🔒 E2E") : null,
       hereCount,
       h("div", { class: "spacer" }),
+      buff.el,
       me.chips,
       h(
         "div",
@@ -112,6 +117,7 @@ export function renderBar(app, backend, { code }) {
         music.el,
         h("button", { class: "btn icon", title: "Jukebox", onclick: () => openJukebox() }, "♫"),
         h("button", { class: "btn icon", title: "Bet booth", onclick: () => openBooth() }, "🎲"),
+        h("button", { class: "btn icon", title: "Wardrobe", onclick: () => openCustomize(backend, { onSaved: () => room?.updateLook() }) }, "🎨"),
         h("button", { class: "btn icon", title: "Link Claude Code", onclick: () => openLinkClaude(backend) }, "🔗"),
         h("button", { class: "btn icon drawer-toggle", title: "Chat and people", onclick: () => sidebar.classList.toggle("open") }, "💬"),
       ),
@@ -122,11 +128,14 @@ export function renderBar(app, backend, { code }) {
     const emoteBar = h(
       "div",
       { class: "emote-bar" },
-      EMOTES.map(([kind, icon]) => h("button", { class: "btn small ghost", title: kind, "aria-label": kind, onclick: () => doEmote(kind) }, icon)),
+      EMOTES.map(([kind, icon]) => h("button", {
+        class: "btn small ghost", title: kind === "drink" ? "Order a drink" : kind, "aria-label": kind,
+        onclick: () => (kind === "drink" ? openDrinks() : doEmote(kind)),
+      }, icon)),
       h("p", { class: "hint" }, "Click the floor to walk · try the dartboard, jukebox, BET booth and the bar"),
     );
 
-    const tabsDef = [["chat", "Chat"], ["here", "Here"], ["friends", "Friends"]];
+    const tabsDef = [["chat", "Chat"], ["here", "Here"], ["top", "Top"], ["friends", "Friends"]];
     const unread = h("span", { class: "count hidden" }, "0");
     let activeTab = "chat";
     let unreadCount = 0;
@@ -137,17 +146,43 @@ export function renderBar(app, backend, { code }) {
     const panes = {
       chat: h("div", { class: "chat-wrap" }, cryptoKey ? h("div", { class: "e2e-note" }, "🔒 End-to-end encrypted with this bar's key") : null, chatLog, chatForm),
       here: h("div", { class: "side-body" }),
+      top: h("div", { class: "side-body" }),
       friends: h("div", { class: "side-body" }),
     };
     const friends = friendsPanel(backend, { onJoin: (l) => navigate(`#/bar/${l.code}`), currentLobbyId: lobby.id });
     cleanup.push(friends.destroy);
     panes.friends.append(friends.el);
-    sidebar.append(h("div", { class: "tabs" }, tabButtons), panes.chat, panes.here, panes.friends);
+    sidebar.append(h("div", { class: "tabs" }, tabButtons), panes.chat, panes.here, panes.top, panes.friends);
+
+    async function renderTop() {
+      let list = [];
+      try {
+        list = await backend.leaderboard(lobby.id);
+      } catch {}
+      replace(
+        panes.top,
+        h("div", { class: "group-title" }, "Jobs shipped this week"),
+        list.length
+          ? list.map((r, i) => h(
+            "div",
+            { class: "leader" },
+            h("span", { class: "rank" }, `#${i + 1}`),
+            portrait(r.look),
+            h("div", { class: "who", style: { minWidth: "0", overflow: "hidden", textOverflow: "ellipsis" } }, `@${r.handle}`, r.id === meId ? h("span", { class: "muted" }, " (you)") : null),
+            h("div", { class: "stat" }, h("div", null, `🤖 ${r.jobs}`), h("div", { class: "muted" }, `🪙 +${r.earned}`)),
+          ))
+          : h("div", { class: "empty" }, "Nobody has shipped anything yet this week."),
+        h("div", { class: "group-title mt" }, "How to earn chips"),
+        EARNING.map(([icon, title, text]) => h("div", { class: "earn-row" }, h("span", null, icon), h("div", null, h("b", null, title), h("div", { class: "muted" }, text)))),
+        h("p", { class: "hint mt" }, "Spend chips on outfits and colors in the 🎨 wardrobe, or on drinks at the bar."),
+      );
+    }
 
     function showTab(id) {
       activeTab = id;
       tabButtons.forEach((b, i) => b.classList.toggle("active", tabsDef[i][0] === id));
       for (const [k, el] of Object.entries(panes)) el.classList.toggle("hidden", k !== id);
+      if (id === "top") renderTop();
       if (id === "chat") {
         unreadCount = 0;
         unread.classList.add("hidden");
@@ -187,7 +222,15 @@ export function renderBar(app, backend, { code }) {
     function doEmote(kind, target = null) {
       stage?.emote(kind === "drink" && target ? target : meId, kind);
       room?.emote(kind, target);
-      if (kind === "drink" && !target) toast(`🍹 The bartender slides you a ${DRINKS[backend.profile.look.drink]?.name || "drink"}`, "gold", 2600);
+    }
+
+    function openDrinks() {
+      openBarMenu(backend, {
+        onOrder: () => {
+          doEmote("drink");
+          room?.updateLook();
+        },
+      });
     }
 
     function openBooth() {
@@ -209,9 +252,14 @@ export function renderBar(app, backend, { code }) {
     async function openDartsGame() {
       if (darts) return;
       const { openDarts } = await import("../games/darts.js");
+      const perk = activeBuff(backend.profile)?.effect;
+      if (perk === "steady") toast("🍸 Steady Hand: your aim barely wobbles", "gold", 2600);
+      if (perk === "courage") toast("🍶 Liquid Courage: your last dart scores double", "gold", 2600);
       darts = openDarts({
         root: document.body,
         lobbyName: lobby.name,
+        steady: perk === "steady",
+        courage: perk === "courage",
         onFinish: async (score) => {
           try {
             await backend.submitScore("darts", lobby.id, score);
@@ -232,7 +280,7 @@ export function renderBar(app, backend, { code }) {
       if (name === "darts") openDartsGame();
       else if (name === "jukebox") openJukebox();
       else if (name === "bets") openBooth();
-      else if (name === "bar") doEmote("drink");
+      else if (name === "bar") openDrinks();
     }
 
     function showProfile(p) {

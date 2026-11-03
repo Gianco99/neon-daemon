@@ -1,13 +1,20 @@
 import { W, H, FLOOR_TOP, FLOOR_BOTTOM, DESKS, STOOLS, LOUNGE, OVERFLOW_DESK, HOTSPOTS, SIGNS, drawStatic, drawAnimated, drawLights, makeProps } from "./bar.js";
-import { drawDaemon, drawDrone } from "./sprites.js";
+import { drawDaemon, drawDrone, drawAura } from "./sprites.js";
 import { h } from "../lib/dom.js";
 import { clamp, hashString, fmtClock } from "../lib/util.js";
-import { normalizeLook } from "../looks.js";
+import { normalizeLook, activeBuff } from "../looks.js";
 import config from "../../config.js";
 
 const EMOJI = { wave: "👋", dance: "🕺", cheer: "🍻", heart: "💖", laugh: "😂", drink: "🍹", fire: "🔥" };
 const EMOTE_ACTION = { wave: "wave", dance: "dance", cheer: "cheer", drink: "sip" };
 const STATE_TEXT = { working: "working", waiting: "needs you", idle: "chilling", offline: "offline" };
+
+function auraColor(buff, t) {
+  if (buff.effect === "sugar") return `hsla(${Math.floor(t * 140) % 360},100%,62%,ALPHA)`;
+  let n = parseInt(buff.color.slice(1), 16);
+  if (((n >> 16) & 255) * 0.3 + ((n >> 8) & 255) * 0.59 + (n & 255) * 0.11 < 110) n = parseInt(buff.garnish.slice(1), 16);
+  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},ALPHA)`;
+}
 
 export function clampToFloor(x, y) {
   let cx = clamp(x, 10, W - 10);
@@ -120,6 +127,7 @@ export class Stage {
           me: p.id === this.opts.meId, seed: (hashString(p.id) % 1000) / 100,
           tagEl: h("div", { class: `ov tag${p.id === this.opts.meId ? " me" : ""}` }, p.handle),
           bubbleEl: null, emote: null, emoteUntil: 0, lastTransform: "",
+          buffInfo: { buff: p.buff, buff_until: p.buffUntil }, tagText: p.handle,
         };
         this.overlay.append(e.tagEl);
         this.entities.set(p.id, e);
@@ -130,10 +138,8 @@ export class Stage {
         }
       } else {
         e.look = look;
-        if (e.handle !== p.handle) {
-          e.handle = p.handle;
-          e.tagEl.textContent = p.handle;
-        }
+        e.buffInfo = { buff: p.buff, buff_until: p.buffUntil };
+        e.handle = p.handle;
       }
     }
     for (const [id, e] of this.entities) {
@@ -386,7 +392,8 @@ export class Stage {
       const dx = e.tx - e.x;
       const dy = e.ty - e.y;
       const dist = Math.hypot(dx, dy);
-      const speed = e.kind === "drone" ? (e.state === "waiting" ? 110 : 72) : 58;
+      const wired = e.kind === "avatar" && activeBuff(e.buffInfo)?.effect === "wired";
+      const speed = e.kind === "drone" ? (e.state === "waiting" ? 110 : 72) : wired ? 104 : 58;
       if (dist > 0.6) {
         const step = Math.min(dist, speed * dt);
         e.x += (dx / dist) * step;
@@ -417,11 +424,21 @@ export class Stage {
   drawEntity(e) {
     const ctx = this.ctx;
     if (e.kind === "avatar") {
+      const buff = activeBuff(e.buffInfo);
+      const tagText = buff ? `${e.handle} ${buff.emoji}` : e.handle;
+      if (e.tagText !== tagText) {
+        e.tagText = tagText;
+        e.tagEl.textContent = tagText;
+      }
       let action = "idle";
       if (e.emote && this.t < e.emoteUntil) action = e.emote;
       else if (e.moving) action = "walk";
-      else if (e.x > 340 && e.y >= 184 && e.y <= 198) action = "sip";
-      drawDaemon(ctx, e.x, e.y, e.look, { t: this.t, action, facing: e.facing, seed: e.seed, music: this.state.music });
+      else if (buff?.effect === "sugar" && Math.sin(this.t * 0.9 + e.seed) > 0.3) action = "dance";
+      else if (buff || (e.x > 340 && e.y >= 184 && e.y <= 198)) action = "sip";
+      let x = e.x;
+      if (buff?.effect === "wired" && Math.random() < 0.35) x += Math.random() < 0.5 ? -1 : 1;
+      if (buff) drawAura(ctx, e.x, e.y, auraColor(buff, this.t), this.t);
+      drawDaemon(ctx, x, e.y, e.look, { t: this.t, action, facing: e.facing, seed: e.seed, music: this.state.music, drink: buff?.id });
     } else {
       const back = e.state === "working" && e.atDesk && !e.moving;
       const drink = e.state === "idle" && !e.moving;

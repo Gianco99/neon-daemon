@@ -8,6 +8,11 @@ create table public.profiles (
   status_text text not null default '' check (char_length(status_text) <= 80),
   chips integer not null default 500 check (chips >= 0),
   chips_topped_at timestamptz,
+  buff text,
+  buff_until timestamptz,
+  streak integer not null default 0,
+  last_daily date,
+  last_hangout timestamptz,
   created_at timestamptz not null default now()
 );
 
@@ -103,6 +108,7 @@ create table public.bets (
   pick text not null check (pick in ('flash', 'grind', 'marathon', 'permission', 'clean')),
   amount integer not null check (amount between 1 and 1000),
   payout integer,
+  boost numeric not null default 1,
   status text not null default 'open' check (status in ('open', 'won', 'lost', 'refunded')),
   created_at timestamptz not null default now(),
   settled_at timestamptz
@@ -132,6 +138,49 @@ create table public.login_requests (
   expires_at timestamptz not null default now() + interval '10 minutes',
   created_at timestamptz not null default now()
 );
+
+create table public.shop_items (
+  kind text not null check (kind in ('body', 'visor', 'eyeColor', 'outfitColor', 'eyes', 'hat', 'outfit', 'accessory', 'droneBody', 'droneStyle')),
+  value text not null,
+  name text not null,
+  price integer not null check (price >= 0),
+  primary key (kind, value)
+);
+
+create table public.unlocks (
+  user_id uuid not null references public.profiles (id) on delete cascade,
+  kind text not null,
+  value text not null,
+  created_at timestamptz not null default now(),
+  primary key (user_id, kind, value),
+  foreign key (kind, value) references public.shop_items (kind, value) on delete cascade
+);
+
+create table public.drinks (
+  id text primary key,
+  name text not null,
+  price integer not null check (price >= 0),
+  minutes integer not null check (minutes > 0),
+  effect text not null
+);
+
+create table public.chip_log (
+  id bigint generated always as identity primary key,
+  user_id uuid not null references public.profiles (id) on delete cascade,
+  source text not null check (source in ('job', 'hangout', 'daily', 'darts', 'bet', 'shop', 'drink', 'topup')),
+  amount integer not null,
+  note text,
+  created_at timestamptz not null default now()
+);
+create index chip_log_user_idx on public.chip_log (user_id, source, created_at desc);
+
+create table public.job_log (
+  id bigint generated always as identity primary key,
+  user_id uuid not null references public.profiles (id) on delete cascade,
+  duration_s integer not null,
+  finished_at timestamptz not null default now()
+);
+create index job_log_user_idx on public.job_log (user_id, finished_at desc);
 
 create or replace function public.normalize_code(p_code text)
 returns text language sql immutable set search_path = '' as $$
@@ -214,6 +263,64 @@ begin
   update public.devices set last_seen = now() where id = v_dev.id;
   return v_dev;
 end $$;
+
+create or replace function public.award(p_user uuid, p_source text, p_amount integer, p_note text default null)
+returns integer language plpgsql security definer set search_path = '' as $$
+declare
+  v_chips integer;
+begin
+  update public.profiles set chips = greatest(0, chips + p_amount) where id = p_user returning chips into v_chips;
+  insert into public.chip_log (user_id, source, amount, note) values (p_user, p_source, p_amount, p_note);
+  return v_chips;
+end $$;
+
+create or replace function public.active_buff(p_user uuid)
+returns text language sql stable security definer set search_path = '' as $$
+  select d.effect from public.profiles p
+  join public.drinks d on d.id = p.buff
+  where p.id = p_user and p.buff_until > now()
+$$;
+
+create or replace function public.earned_today(p_user uuid, p_source text)
+returns integer language sql stable security definer set search_path = '' as $$
+  select coalesce(sum(amount), 0)::integer from public.chip_log
+  where user_id = p_user and source = p_source and created_at >= date_trunc('day', now())
+$$;
+
+create or replace function public.count_today(p_user uuid, p_source text)
+returns integer language sql stable security definer set search_path = '' as $$
+  select count(*)::integer from public.chip_log
+  where user_id = p_user and source = p_source and created_at >= date_trunc('day', now())
+$$;
+
+create or replace function public.validate_look()
+returns trigger language plpgsql security definer set search_path = '' as $$
+declare
+  v_key text;
+  v_value text;
+begin
+  if jsonb_typeof(new.look) <> 'object' then
+    raise exception 'look must be an object' using errcode = '23514';
+  end if;
+  for v_key, v_value in select key, value #>> '{}' from jsonb_each(new.look) loop
+    if v_key = 'drink' then
+      if not exists (select 1 from public.drinks where id = v_value) then
+        raise exception 'unknown drink %', v_value;
+      end if;
+    elsif not exists (
+      select 1 from public.shop_items s
+      where s.kind = v_key and s.value = v_value
+        and (s.price = 0 or exists (select 1 from public.unlocks u where u.user_id = new.id and u.kind = v_key and u.value = v_value))
+    ) then
+      raise exception 'you haven''t unlocked % %', v_key, v_value using errcode = '42501';
+    end if;
+  end loop;
+  return new;
+end $$;
+
+create trigger profiles_validate_look
+  before insert or update of look on public.profiles
+  for each row execute function public.validate_look();
 
 create or replace function public.handle_new_user()
 returns trigger language plpgsql security definer set search_path = '' as $$
@@ -390,13 +497,43 @@ returns jsonb language sql stable security definer set search_path = '' as $$
 $$;
 
 create or replace function public.touch(p_lobby uuid default null)
-returns void language plpgsql security definer set search_path = '' as $$
+returns jsonb language plpgsql security definer set search_path = '' as $$
 declare
   v_uid uuid := public.require_user();
+  v_member boolean := public.is_member(p_lobby, v_uid);
+  v_prev public.user_status;
+  v_prof public.profiles;
+  v_out jsonb := '[]'::jsonb;
+  v_amount integer;
+  v_streak integer;
 begin
+  select * into v_prev from public.user_status where user_id = v_uid;
   insert into public.user_status (user_id, current_lobby, last_seen)
-    values (v_uid, case when public.is_member(p_lobby, v_uid) then p_lobby end, now())
+    values (v_uid, case when v_member then p_lobby end, now())
     on conflict (user_id) do update set current_lobby = excluded.current_lobby, last_seen = excluded.last_seen;
+  select * into v_prof from public.profiles where id = v_uid for update;
+  if v_prof.last_daily is distinct from current_date then
+    v_streak := case when v_prof.last_daily = current_date - 1 then v_prof.streak + 1 else 1 end;
+    v_amount := 50 + 10 * least(v_streak - 1, 10);
+    update public.profiles set streak = v_streak, last_daily = current_date where id = v_uid;
+    perform public.award(v_uid, 'daily', v_amount, format('day %s of your streak', v_streak));
+    v_out := v_out || jsonb_build_array(jsonb_build_object('source', 'daily', 'amount', v_amount, 'streak', v_streak));
+  end if;
+  if v_member then
+    if v_prev.current_lobby is not null and v_prev.last_seen > now() - interval '2 minutes' and v_prof.last_hangout is not null then
+      if v_prof.last_hangout < now() - interval '10 minutes' then
+        if public.count_today(v_uid, 'hangout') < 12 then
+          v_amount := case when public.active_buff(v_uid) = 'island' then 10 else 5 end;
+          perform public.award(v_uid, 'hangout', v_amount, 'hung out at the bar');
+          v_out := v_out || jsonb_build_array(jsonb_build_object('source', 'hangout', 'amount', v_amount));
+        end if;
+        update public.profiles set last_hangout = now() where id = v_uid;
+      end if;
+    else
+      update public.profiles set last_hangout = now() where id = v_uid;
+    end if;
+  end if;
+  return v_out;
 end $$;
 
 create or replace function public.send_friend_request(p_handle text)
@@ -568,9 +705,12 @@ begin
       v_status := case when (v_bet.pick = 'permission') = coalesce(p_asked, false) then 'won' else 'lost' end;
       v_payout := case when v_status = 'won' then v_bet.amount * 2 else 0 end;
     end if;
+    if v_status = 'won' then
+      v_payout := floor(v_payout * v_bet.boost)::integer;
+    end if;
     update public.bets set status = v_status, payout = v_payout, settled_at = now() where id = v_bet.id;
     if v_payout > 0 then
-      update public.profiles set chips = chips + v_payout where id = v_bet.bettor_id;
+      perform public.award(v_bet.bettor_id, 'bet', v_payout, case when v_status = 'refunded' then 'bet refunded' else 'bet won' end);
     end if;
     v_out := v_out || jsonb_build_array(jsonb_build_object(
       'bettor', (select handle from public.profiles where id = v_bet.bettor_id),
@@ -592,6 +732,7 @@ declare
   v_asked boolean;
   v_settled jsonb := '[]'::jsonb;
   v_duration double precision;
+  v_reward integer := 0;
 begin
   if p_state is null or p_state not in ('idle', 'working', 'waiting', 'offline') then
     raise exception 'state must be idle, working, waiting or offline';
@@ -622,6 +763,13 @@ begin
         else 'marathon'
       end,
       v_prev.asked_permission);
+    if p_state = 'idle' and v_duration >= 15 then
+      insert into public.job_log (user_id, duration_s) values (v_dev.user_id, round(v_duration)::integer);
+      if public.count_today(v_dev.user_id, 'job') < 20 then
+        v_reward := case when public.active_buff(v_dev.user_id) = 'fresh' then 20 else 10 end;
+        perform public.award(v_dev.user_id, 'job', v_reward, 'your agent shipped a job');
+      end if;
+    end if;
   end if;
   insert into public.agent_sessions (user_id, session_key, device_id, state, label, tool, turn_no, turn_started_at, asked_permission, updated_at)
     values (v_dev.user_id, p_session, v_dev.id, p_state, left(nullif(btrim(p_label), ''), 32), left(nullif(btrim(p_tool), ''), 24), v_turn, v_started, v_asked, now())
@@ -640,6 +788,7 @@ begin
     'turn', v_turn,
     'open_bets', (select count(*) from public.bets b where b.owner_id = v_dev.user_id and b.session_key = p_session and b.turn_no = v_turn and b.status = 'open'),
     'duration_s', v_duration,
+    'reward', v_reward,
     'settled', v_settled);
 end $$;
 
@@ -704,8 +853,9 @@ begin
   if v_chips is null then
     raise exception 'not enough chips';
   end if;
-  insert into public.bets (bettor_id, owner_id, session_key, turn_no, pick, amount)
-    values (v_uid, p_owner, p_session, v_agent.turn_no, p_pick, p_amount);
+  insert into public.bets (bettor_id, owner_id, session_key, turn_no, pick, amount, boost)
+    values (v_uid, p_owner, p_session, v_agent.turn_no, p_pick, p_amount, case when public.active_buff(v_uid) = 'lucky' then 1.5 else 1 end);
+  insert into public.chip_log (user_id, source, amount, note) values (v_uid, 'bet', -p_amount, 'placed a bet');
   return jsonb_build_object('ok', true, 'chips', v_chips);
 end $$;
 
@@ -721,7 +871,7 @@ begin
     for update
   loop
     update public.bets set status = 'refunded', payout = v_bet.amount, settled_at = now() where id = v_bet.id;
-    update public.profiles set chips = chips + v_bet.amount where id = v_uid;
+    perform public.award(v_uid, 'bet', v_bet.amount, 'stale bet refunded');
   end loop;
   return (
     select coalesce(jsonb_agg(jsonb_build_object(
@@ -754,8 +904,97 @@ begin
   if v_chips is null then
     raise exception 'the bartender says come back later';
   end if;
+  insert into public.chip_log (user_id, source, amount, note) values (v_uid, 'topup', 250, 'the bartender spotted you');
   return v_chips;
 end $$;
+
+create or replace function public.buy_item(p_kind text, p_value text)
+returns jsonb language plpgsql security definer set search_path = '' as $$
+declare
+  v_uid uuid := public.require_user();
+  v_item public.shop_items;
+  v_chips integer;
+begin
+  select * into v_item from public.shop_items where kind = p_kind and value = p_value;
+  if not found then
+    raise exception 'that isn''t for sale';
+  end if;
+  if v_item.price = 0 or exists (select 1 from public.unlocks where user_id = v_uid and kind = p_kind and value = p_value) then
+    return jsonb_build_object('ok', true, 'chips', (select chips from public.profiles where id = v_uid));
+  end if;
+  update public.profiles set chips = chips - v_item.price where id = v_uid and chips >= v_item.price returning chips into v_chips;
+  if v_chips is null then
+    raise exception 'not enough chips for %', v_item.name;
+  end if;
+  insert into public.unlocks (user_id, kind, value) values (v_uid, p_kind, p_value);
+  insert into public.chip_log (user_id, source, amount, note) values (v_uid, 'shop', -v_item.price, v_item.name);
+  return jsonb_build_object('ok', true, 'chips', v_chips);
+end $$;
+
+create or replace function public.order_drink(p_drink text)
+returns jsonb language plpgsql security definer set search_path = '' as $$
+declare
+  v_uid uuid := public.require_user();
+  v_drink public.drinks;
+  v_chips integer;
+  v_until timestamptz;
+begin
+  select * into v_drink from public.drinks where id = p_drink;
+  if not found then
+    raise exception 'the bartender has never heard of that one';
+  end if;
+  v_until := now() + make_interval(mins => v_drink.minutes);
+  update public.profiles set chips = chips - v_drink.price, buff = v_drink.id, buff_until = v_until
+    where id = v_uid and chips >= v_drink.price
+    returning chips into v_chips;
+  if v_chips is null then
+    raise exception 'not enough chips for a %', v_drink.name;
+  end if;
+  insert into public.chip_log (user_id, source, amount, note) values (v_uid, 'drink', -v_drink.price, v_drink.name);
+  return jsonb_build_object('chips', v_chips, 'buff', v_drink.id, 'buff_until', v_until);
+end $$;
+
+create or replace function public.leaderboard(p_lobby uuid default null)
+returns jsonb language sql stable security definer set search_path = '' as $$
+  with people as (
+    select m.user_id from public.lobby_members m
+    where p_lobby is not null and m.lobby_id = p_lobby and public.is_member(p_lobby, auth.uid())
+    union
+    select auth.uid() where auth.uid() is not null
+    union
+    select case when f.user_a = auth.uid() then f.user_b else f.user_a end
+    from public.friendships f
+    where p_lobby is null and f.status = 'accepted' and auth.uid() in (f.user_a, f.user_b)
+  )
+  select coalesce(jsonb_agg(jsonb_build_object('id', t.id, 'handle', t.handle, 'look', t.look, 'jobs', t.jobs, 'earned', t.earned)
+    order by t.jobs desc, t.earned desc, t.handle), '[]'::jsonb)
+  from (
+    select p.id, p.handle, p.look,
+      (select count(*) from public.job_log j where j.user_id = p.id and j.finished_at > now() - interval '7 days') as jobs,
+      (select coalesce(sum(c.amount), 0) from public.chip_log c
+        where c.user_id = p.id and c.amount > 0 and c.source in ('job', 'hangout', 'daily', 'darts')
+          and c.created_at > now() - interval '7 days') as earned
+    from people x
+    join public.profiles p on p.id = x.user_id
+    order by jobs desc, earned desc
+    limit 25
+  ) t
+$$;
+
+create or replace function public.reward_darts()
+returns trigger language plpgsql security definer set search_path = '' as $$
+declare
+  v_amount integer := least(new.score / 10, 50 - public.earned_today(new.user_id, 'darts'));
+begin
+  if v_amount > 0 then
+    perform public.award(new.user_id, 'darts', v_amount, format('darts game: %s points', new.score));
+  end if;
+  return new;
+end $$;
+
+create trigger scores_reward
+  after insert on public.scores
+  for each row execute function public.reward_darts();
 
 create or replace function public.top_scores(p_game text, p_lobby uuid)
 returns jsonb language sql stable security invoker set search_path = '' as $$
@@ -878,6 +1117,22 @@ alter table public.agent_sessions enable row level security;
 alter table public.bets enable row level security;
 alter table public.scores enable row level security;
 alter table public.login_requests enable row level security;
+alter table public.shop_items enable row level security;
+alter table public.unlocks enable row level security;
+alter table public.drinks enable row level security;
+alter table public.chip_log enable row level security;
+alter table public.job_log enable row level security;
+
+create policy "anyone can browse the shop" on public.shop_items
+  for select to anon, authenticated using (true);
+create policy "anyone can read the drinks menu" on public.drinks
+  for select to anon, authenticated using (true);
+create policy "you see your unlocks" on public.unlocks
+  for select to authenticated using (user_id = (select auth.uid()));
+create policy "you see your chip history" on public.chip_log
+  for select to authenticated using (user_id = (select auth.uid()));
+create policy "you see your jobs" on public.job_log
+  for select to authenticated using (user_id = (select auth.uid()));
 
 create policy "signed-in users see profiles" on public.profiles
   for select to authenticated using (true);
@@ -922,6 +1177,7 @@ revoke insert, update, delete on public.profiles, public.lobbies, public.lobby_m
   public.friendships, public.agent_sessions, public.bets from anon, authenticated;
 revoke update, delete on public.lobby_messages, public.scores from anon, authenticated;
 revoke insert, update on public.devices from anon, authenticated;
+revoke insert, update, delete on public.shop_items, public.unlocks, public.drinks, public.chip_log, public.job_log from anon, authenticated;
 grant update (handle, display_name, look, status_text) on public.profiles to authenticated;
 
 revoke execute on all functions in schema public from public, anon, authenticated;
@@ -958,7 +1214,10 @@ grant execute on function
   public.place_bet(uuid, text, text, integer),
   public.my_bets(),
   public.top_up(),
-  public.top_scores(text, uuid)
+  public.top_scores(text, uuid),
+  public.buy_item(text, text),
+  public.order_drink(text),
+  public.leaderboard(uuid)
 to authenticated;
 
 grant execute on function
@@ -969,9 +1228,102 @@ to service_role;
 alter publication supabase_realtime add table
   public.lobby_messages,
   public.agent_sessions,
-  public.bets;
+  public.bets,
+  public.chip_log;
 
 create policy "bar members use bar channels" on realtime.messages
   for select to authenticated using (public.is_member(public.lobby_from_topic(realtime.topic()), (select auth.uid())));
 create policy "bar members send on bar channels" on realtime.messages
   for insert to authenticated with check (public.is_member(public.lobby_from_topic(realtime.topic()), (select auth.uid())));
+
+insert into public.shop_items (kind, value, name, price) values
+  ('body', '#26232f', 'Midnight', 0),
+  ('body', '#c9d1e3', 'Chrome', 150),
+  ('body', '#f6f6ff', 'Pearl', 150),
+  ('body', '#6c70e0', 'Indigo', 150),
+  ('body', '#ff6f61', 'Coral', 150),
+  ('body', '#ff4fa3', 'Hot Pink', 200),
+  ('body', '#39f3ff', 'Cyan', 200),
+  ('body', '#7dffc4', 'Mint', 200),
+  ('body', '#b892ff', 'Lilac', 200),
+  ('body', '#ff9a3c', 'Sunset', 250),
+  ('body', '#a8ff60', 'Lime', 250),
+  ('body', '#ffd166', 'Gold', 500),
+  ('visor', '#120a2a', 'Smoke', 0),
+  ('visor', '#0d2140', 'Deep Sea', 75),
+  ('visor', '#2a0f3a', 'Plum', 75),
+  ('visor', '#082a26', 'Lagoon', 75),
+  ('visor', '#301018', 'Wine', 75),
+  ('visor', '#1c1c1c', 'Onyx', 75),
+  ('eyeColor', '#ffffff', 'White', 0),
+  ('eyeColor', '#00f0ff', 'Cyan', 100),
+  ('eyeColor', '#ff2e97', 'Pink', 100),
+  ('eyeColor', '#ffe45e', 'Yellow', 100),
+  ('eyeColor', '#7dffc4', 'Mint', 100),
+  ('eyeColor', '#ff4d4d', 'Red', 150),
+  ('eyeColor', '#b892ff', 'Violet', 150),
+  ('eyeColor', '#ff9a3c', 'Amber', 150),
+  ('outfitColor', '#2b2d42', 'Charcoal', 0),
+  ('outfitColor', '#111111', 'Black', 50),
+  ('outfitColor', '#f6f6ff', 'White', 100),
+  ('outfitColor', '#ff8fc7', 'Flamingo', 150),
+  ('outfitColor', '#7fe7ff', 'Ice', 150),
+  ('outfitColor', '#ffd1a6', 'Peach', 150),
+  ('outfitColor', '#b8f2c9', 'Seafoam', 150),
+  ('outfitColor', '#8a2be2', 'Purple', 200),
+  ('outfitColor', '#ff2e97', 'Neon Pink', 200),
+  ('outfitColor', '#3a86ff', 'Ocean', 200),
+  ('outfitColor', '#ffe45e', 'Lemon', 200),
+  ('outfitColor', '#e85d04', 'Ember', 250),
+  ('eyes', 'dots', 'Dots', 0),
+  ('eyes', 'sleepy', 'Sleepy', 100),
+  ('eyes', 'visor', 'Visor', 150),
+  ('eyes', 'happy', 'Happy', 150),
+  ('eyes', 'stars', 'Stars', 250),
+  ('eyes', 'hearts', 'Hearts', 250),
+  ('eyes', 'x', 'Glitched', 300),
+  ('hat', 'cap', 'Cap', 0),
+  ('hat', 'none', 'None', 0),
+  ('hat', 'beanie', 'Beanie', 200),
+  ('hat', 'headphones', 'Headphones', 300),
+  ('hat', 'fedora', 'Fedora', 400),
+  ('hat', 'mohawk', 'Mohawk', 400),
+  ('hat', 'halo', 'Halo', 750),
+  ('hat', 'crown', 'Crown', 1000),
+  ('outfit', 'jacket', 'Leather', 0),
+  ('outfit', 'tank', 'Tank top', 150),
+  ('outfit', 'hoodie', 'Hoodie', 200),
+  ('outfit', 'hawaiian', 'Hawaiian', 300),
+  ('outfit', 'blazer', 'Pastel blazer', 400),
+  ('outfit', 'suit', 'Sharp suit', 500),
+  ('accessory', 'none', 'None', 0),
+  ('accessory', 'scarf', 'Scarf', 150),
+  ('accessory', 'bowtie', 'Bow tie', 200),
+  ('accessory', 'shades', 'Shades', 300),
+  ('accessory', 'chain', 'Gold chain', 500),
+  ('droneBody', '#26232f', 'Midnight', 0),
+  ('droneBody', '#c9d1e3', 'Chrome', 90),
+  ('droneBody', '#f6f6ff', 'Pearl', 90),
+  ('droneBody', '#6c70e0', 'Indigo', 90),
+  ('droneBody', '#ff6f61', 'Coral', 90),
+  ('droneBody', '#ff4fa3', 'Hot Pink', 120),
+  ('droneBody', '#39f3ff', 'Cyan', 120),
+  ('droneBody', '#7dffc4', 'Mint', 120),
+  ('droneBody', '#b892ff', 'Lilac', 120),
+  ('droneBody', '#ff9a3c', 'Sunset', 150),
+  ('droneBody', '#a8ff60', 'Lime', 150),
+  ('droneBody', '#ffd166', 'Gold', 300),
+  ('droneStyle', 'rotor', 'Rotor', 0),
+  ('droneStyle', 'antenna', 'Antennae', 200),
+  ('droneStyle', 'dish', 'Dish', 300),
+  ('droneStyle', 'cat', 'Cat ears', 400),
+  ('droneStyle', 'crown', 'Tiny crown', 800);
+
+insert into public.drinks (id, name, price, minutes, effect) values
+  ('soda', 'Synth Soda', 15, 10, 'sugar'),
+  ('espresso', 'Espresso Tonic', 20, 10, 'wired'),
+  ('pina', 'Piña Colada', 25, 20, 'island'),
+  ('martini', 'Neon Martini', 30, 10, 'steady'),
+  ('sake', 'Hot Sake', 30, 10, 'courage'),
+  ('mojito', 'Mojito', 35, 30, 'fresh'),
+  ('blue', 'Blue Lagoon', 40, 15, 'lucky');

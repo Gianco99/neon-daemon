@@ -165,6 +165,7 @@ export function drawDaemon(ctx, x, y, look, o = {}) {
 
   const P = painter(ctx, cx, by, o.facing ?? 1);
   const Pb = painter(ctx, cx, by + bob, o.facing ?? 1);
+  const drinkKey = o.drink || look.drink;
   const B = look.body;
   const Bd = shade(B, -0.28);
   const Bl = shade(B, 0.4);
@@ -256,7 +257,7 @@ export function drawDaemon(ctx, x, y, look, o = {}) {
     const a = action === "dance" ? frame % 2 : 0;
     Pb(-8, -17 + a, 2, 5, sleeve); Pb(-8, -18 + a, 2, 1, B);
     Pb(6, -17 - a + 1, 2, 5, sleeve); Pb(6, -18 - a + 1, 2, 1, B);
-    if (action === "cheer") drawGlass(Pb, 6, -22, look.drink);
+    if (action === "cheer") drawGlass(Pb, 6, -22, drinkKey);
   } else if (action === "type") {
     const k = Math.floor(t * 10) % 2;
     Pb(-6, -11, 2, 3, sleeve); Pb(-5, -8 - k, 2, 1, B);
@@ -269,10 +270,10 @@ export function drawDaemon(ctx, x, y, look, o = {}) {
     Pb(-7, -12 + swing, 2, 5, sleeve); Pb(-7, -7 + swing, 2, 1, B);
     if (sipping) {
       Pb(5, -15, 2, 4, sleeve); Pb(4, -16, 2, 1, B);
-      drawGlass(Pb, 1, -20, look.drink);
+      drawGlass(Pb, 1, -20, drinkKey);
     } else {
       Pb(5, -12, 2, 5, sleeve); Pb(5, -7, 2, 1, B);
-      drawGlass(Pb, 6, -11, look.drink);
+      drawGlass(Pb, 6, -11, drinkKey);
     }
   } else {
     Pb(-7, -12 + swing, 2, 5, sleeve); Pb(-7, -7 + swing, 2, 1, B);
@@ -312,7 +313,7 @@ export function drawDrone(ctx, x, y, look, o = {}) {
   const hover = Math.round(Math.sin(t * 3 + seed) * 1.4);
   const cy = by - 12 + hover;
   const P = painter(ctx, cx, cy, o.facing ?? 1);
-  const B = look.body;
+  const B = look.droneBody || look.body;
   const Bd = shade(B, -0.32);
   const Bl = shade(B, 0.4);
 
@@ -350,13 +351,59 @@ export function drawDrone(ctx, x, y, look, o = {}) {
     }
   }
 
-  P(0, -6, 1, 2, "#8a8fb0");
-  const spin = Math.floor(t * 24 + seed) % 3;
-  const w = [7, 3, 5][spin];
-  P(-Math.floor(w / 2), -7, w, 1, "#d7e3ff");
-  P(0, -7, 1, 1, S);
+  switch (look.droneStyle) {
+    case "antenna":
+      P(-3, -6, 1, 2, "#8a8fb0");
+      P(2, -6, 1, 2, "#8a8fb0");
+      P(-3, -7, 1, 1, S);
+      P(2, -7, 1, 1, Math.floor(t * 3 + seed) % 2 ? S : "#ffffff");
+      break;
+    case "dish": {
+      const tilt = Math.round(Math.sin(t * 1.5 + seed));
+      P(0, -6, 1, 2, "#8a8fb0");
+      P(-2 + tilt, -7, 5, 1, "#c9d1e3");
+      P(-3 + tilt, -8, 1, 1, "#c9d1e3");
+      P(3 + tilt, -8, 1, 1, "#c9d1e3");
+      P(tilt, -9, 1, 1, S);
+      break;
+    }
+    case "cat":
+      P(-4, -6, 2, 2, B);
+      P(-4, -7, 1, 1, B);
+      P(2, -6, 2, 2, B);
+      P(3, -7, 1, 1, B);
+      P(-3, -5, 1, 1, "#ff7ac8");
+      P(2, -5, 1, 1, "#ff7ac8");
+      break;
+    case "crown":
+      P(-3, -6, 7, 2, "#ffd166");
+      P(-3, -7, 1, 1, "#ffd166");
+      P(0, -8, 1, 2, "#ffd166");
+      P(3, -7, 1, 1, "#ffd166");
+      P(0, -6, 1, 1, "#ff2e97");
+      break;
+    default: {
+      P(0, -6, 1, 2, "#8a8fb0");
+      const spin = Math.floor(t * 24 + seed) % 3;
+      const w = [7, 3, 5][spin];
+      P(-Math.floor(w / 2), -7, w, 1, "#d7e3ff");
+      P(0, -7, 1, 1, S);
+    }
+  }
 
   if (o.drink && !o.back) drawGlass(P, 5, -1, look.drink);
+}
+
+export function drawAura(ctx, x, y, color, t, strength = 1) {
+  const pulse = 0.75 + Math.sin(t * 3) * 0.25;
+  const g = ctx.createRadialGradient(x, y - 12, 0, x, y - 12, 15 + pulse * 3);
+  g.addColorStop(0, color.replace("ALPHA", (0.42 * strength * pulse).toFixed(3)));
+  g.addColorStop(1, color.replace("ALPHA", "0"));
+  ctx.save();
+  ctx.globalCompositeOperation = "lighter";
+  ctx.fillStyle = g;
+  ctx.fillRect(x - 20, y - 32, 40, 40);
+  ctx.restore();
 }
 
 export function renderPortrait(canvas, look, { size = 24, full = false, t = 0 } = {}) {

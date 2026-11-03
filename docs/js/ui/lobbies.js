@@ -9,7 +9,7 @@ import { openLinkClaude } from "./link.js";
 
 export function userMenu(backend) {
   return () => [
-    { icon: "🎨", label: "Customize your daemon", run: () => openCustomize(backend) },
+    { icon: "🎨", label: "Wardrobe", run: () => openCustomize(backend) },
     { icon: "🔗", label: "Link Claude Code", run: () => openLinkClaude(backend) },
     { icon: "🍸", label: "Bars", run: () => navigate("#/") },
     { icon: "🚪", label: "Sign out", run: () => backend.signOut() },

@@ -338,7 +338,7 @@ function callout(result) {
   return { text: result.label, kind: 'is-single' };
 }
 
-export function openDarts({ root, lobbyName, onFinish, loadLeaderboard, onClose } = {}) {
+export function openDarts({ root, lobbyName, onFinish, loadLeaderboard, onClose, steady = false, courage = false } = {}) {
   injectStyle();
   const host = root || document.body;
   const css = getComputedStyle(document.documentElement);
@@ -654,14 +654,15 @@ export function openDarts({ root, lobbyName, onFinish, loadLeaderboard, onClose 
     const call = callout(result);
     darts.push({ nx: (to.x - c) / radius, ny: (to.y - c) / radius, color });
     flashes.push({ x: to.x, y: to.y, start: clock, color: flashColor(call.kind), big: call.kind === 'is-bull' || call.kind === 'is-treble' });
-    total += result.points;
+    const points = courage && thrown === DARTS - 1 ? result.points * 2 : result.points;
+    total += points;
     thrown += 1;
     if (result.points >= 50) shake = 0.35;
     popup(call, result, to);
     bumpTotal();
     syncHud();
-    lastEl.textContent = result.points ? `${call.text} +${result.points}` : call.text;
-    live.textContent = `${result.label}, ${result.points} points. Total ${total}.`;
+    lastEl.textContent = points ? `${call.text} +${points}${points !== result.points ? " (doubled)" : ""}` : call.text;
+    live.textContent = `${result.label}, ${points} points. Total ${total}.`;
     if (thrown >= DARTS) {
       phase = 'done';
       endTimer = setTimeout(showEnd, 900);
@@ -675,7 +676,7 @@ export function openDarts({ root, lobbyName, onFinish, loadLeaderboard, onClose 
     clock += dt;
     if (holding) stamina = Math.max(0, stamina - dt / 2.4);
     else stamina = Math.min(1, stamina + dt / 1.4);
-    const target = holding ? (stamina > 0 ? 0.03 + (1 - stamina) * 0.025 : 0.34) : 0.15;
+    const target = (holding ? (stamina > 0 ? 0.03 + (1 - stamina) * 0.025 : 0.34) : 0.15) * (steady ? 0.4 : 1);
     amp += (target - amp) * (1 - Math.exp(-dt * (holding ? 5 : 2.5)));
     shake = Math.max(0, shake - dt);
     flashes = flashes.filter((f) => clock - f.start < 0.7);

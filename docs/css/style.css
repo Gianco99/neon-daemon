@@ -255,6 +255,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
   font-size: 20px;
   letter-spacing: 0.12em;
   cursor: pointer;
+  white-space: nowrap;
 }
 
 .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: #5b4a78; flex: none; }
@@ -551,6 +552,23 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .pills { display: flex; flex-wrap: wrap; gap: 6px; }
 .pill { padding: 4px 10px; border-radius: 999px; border: 1px solid rgba(0, 240, 255, 0.35); background: rgba(0, 0, 0, 0.3); font-size: 18px; cursor: pointer; }
 .pill.on { background: rgba(0, 240, 255, 0.2); border-color: var(--nd-cyan); box-shadow: 0 0 10px rgba(0, 240, 255, 0.45); }
+.pill.locked { border-style: dashed; color: var(--nd-text-dim); }
+.pill .price { font-size: 15px; color: var(--nd-yellow); }
+.swatch.locked { position: relative; font-size: 11px; line-height: 26px; text-align: center; filter: saturate(0.6) brightness(0.8); }
+.swatch.locked.on { filter: none; }
+.drink-list { display: grid; gap: 8px; margin: 12px 0; }
+.drink-card { display: grid; grid-template-columns: 44px minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 10px 12px; border-radius: 12px; background: rgba(0, 0, 0, 0.35); border: 1px solid rgba(255, 228, 94, 0.2); }
+.drink-card.on { border-color: var(--nd-yellow); box-shadow: 0 0 14px rgba(255, 228, 94, 0.35); }
+.drink-emoji { font-size: 30px; text-align: center; }
+.drink-name { font-size: 22px; color: #fff; }
+.leader { display: grid; grid-template-columns: 22px 40px minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 6px 8px; border-radius: 10px; }
+.leader:nth-child(1) .rank { color: var(--nd-yellow); text-shadow: 0 0 10px var(--nd-yellow); }
+.leader .rank { font-family: var(--nd-font-ui); font-size: 12px; text-align: center; color: var(--nd-text-dim); }
+.leader canvas { width: 40px; height: 40px; image-rendering: pixelated; border-radius: 10px; background: radial-gradient(circle at 50% 35%, #3a1366, #0d0221); }
+.leader .stat { text-align: right; font-size: 17px; line-height: 1.1; }
+.earn-row { display: grid; grid-template-columns: 26px minmax(0, 1fr); gap: 8px; padding: 5px 0; font-size: 17px; }
+.version-tag { position: fixed; right: 12px; bottom: 10px; z-index: 5; font-family: var(--nd-font-ui); font-size: 10px; letter-spacing: 0.16em; color: var(--nd-text-dim); opacity: 0.7; }
+@media (max-width: 620px) { .drink-card { grid-template-columns: 34px minmax(0, 1fr); } .drink-card .btn { grid-column: 1 / -1; } }
 
 .bet-agent { padding: 12px; border-radius: 12px; background: rgba(0, 0, 0, 0.35); border: 1px solid rgba(0, 240, 255, 0.25); margin-bottom: 10px; }
 .bet-agent .top { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }

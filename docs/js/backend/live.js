@@ -21,12 +21,31 @@ export async function createLiveBackend() {
   let user = null;
   let profile = null;
 
+  let unlockCache = null;
+  let earnings = null;
+  const EARN_LABEL = { job: "your agent shipped a job", hangout: "hanging out", daily: "daily streak", darts: "darts" };
+
   async function loadProfile() {
-    const data = check(await sb.from("profiles").select("id, handle, display_name, look, status_text, chips").eq("id", user.id).single());
+    const data = check(await sb.from("profiles").select("id, handle, display_name, look, status_text, chips, buff, buff_until, streak").eq("id", user.id).single());
     profile = { ...data, look: normalizeLook(data.look, data.id) };
     profiles.set(profile.id, profile);
     bus.emit("profile", profile);
     return profile;
+  }
+
+  function watchEarnings() {
+    if (earnings) sb.removeChannel(earnings);
+    earnings = null;
+    unlockCache = null;
+    if (!user) return;
+    earnings = sb.channel(`me-${user.id}-${randomHex(3)}`)
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "chip_log", filter: `user_id=eq.${user.id}` }, ({ new: row }) => {
+        if (row.amount > 0 && EARN_LABEL[row.source]) {
+          bus.emit("earned", { amount: row.amount, source: row.source, label: EARN_LABEL[row.source], note: row.note });
+          api.refreshChips().catch(() => null);
+        }
+      })
+      .subscribe();
   }
 
   async function profileOf(id) {
@@ -49,6 +68,7 @@ export async function createLiveBackend() {
       if (user) {
         await sb.realtime.setAuth(data.session.access_token);
         await loadProfile().catch(() => null);
+        watchEarnings();
       }
       sb.auth.onAuthStateChange((event, session) => {
         setTimeout(async () => {
@@ -58,6 +78,7 @@ export async function createLiveBackend() {
             user = next;
             profile = null;
             if (user) await loadProfile().catch(() => null);
+            watchEarnings();
             bus.emit("auth", user);
           }
         }, 0);
@@ -115,6 +136,7 @@ export async function createLiveBackend() {
 
     async signOut() {
       await sb.removeAllChannels();
+      earnings = null;
       await sb.auth.signOut();
     },
 
@@ -228,6 +250,33 @@ export async function createLiveBackend() {
       return data.chips;
     },
 
+    async unlocks() {
+      if (unlockCache) return unlockCache;
+      const rows = check(await sb.from("unlocks").select("kind, value")) || [];
+      unlockCache = new Set(rows.map((r) => `${r.kind}:${r.value}`));
+      return unlockCache;
+    },
+
+    async buyItem(kind, value) {
+      const res = check(await sb.rpc("buy_item", { p_kind: kind, p_value: value }));
+      unlockCache?.add(`${kind}:${value}`);
+      profile = { ...profile, chips: res.chips };
+      bus.emit("profile", profile);
+      return res;
+    },
+
+    async orderDrink(id) {
+      const res = check(await sb.rpc("order_drink", { p_drink: id }));
+      profile = { ...profile, chips: res.chips, buff: res.buff, buff_until: res.buff_until };
+      bus.emit("profile", profile);
+      return res;
+    },
+
+    async leaderboard(lobbyId) {
+      const list = check(await sb.rpc("leaderboard", { p_lobby: lobbyId ?? null })) || [];
+      return list.map((r) => ({ ...r, look: normalizeLook(r.look, r.id) }));
+    },
+
     async submitScore(game, lobbyId, score) {
       check(await sb.from("scores").insert({ game, lobby_id: lobbyId ?? null, score }));
     },
@@ -245,7 +294,7 @@ export async function createLiveBackend() {
       let closed = false;
       let trackTimer = 0;
 
-      const presencePayload = () => ({ handle: profile.handle, look: profile.look, x: pos.x, y: pos.y });
+      const presencePayload = () => ({ handle: profile.handle, look: profile.look, x: pos.x, y: pos.y, buff: profile.buff ?? null, buffUntil: profile.buff_until ?? null });
 
       const emitAgents = () => {
         const cutoff = Date.now() - AGENT_WINDOW_MS;
@@ -307,7 +356,7 @@ export async function createLiveBackend() {
         peers.clear();
         for (const [id, metas] of Object.entries(state)) {
           const m = metas[metas.length - 1];
-          peers.set(id, { id, handle: m.handle, look: normalizeLook(m.look, id), x: m.x, y: m.y });
+          peers.set(id, { id, handle: m.handle, look: normalizeLook(m.look, id), x: m.x, y: m.y, buff: m.buff, buffUntil: m.buffUntil });
         }
         emitter.emit("peers", [...peers.values()]);
         refreshAgents();

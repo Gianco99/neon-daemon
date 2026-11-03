@@ -66,6 +66,7 @@ async function boot() {
     return;
   }
   if (backend.mode === "demo") document.body.append(h("div", { class: "demo-ribbon" }, "DEMO MODE"));
+  document.body.append(h("div", { class: "version-tag" }, `v${config.version || "0.1.0"}`));
   backend.on("auth", () => {
     screenKey = "";
     route();

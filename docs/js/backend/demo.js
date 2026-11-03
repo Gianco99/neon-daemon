@@ -1,7 +1,7 @@
 import { createEmitter, pick, BET_WINDOW_S, bucketFor } from "../lib/util.js";
 import { randomString, randomHex, sha256Hex, normalizeCode, seal, unseal } from "../lib/crypto.js";
 import { load, save } from "../lib/store.js";
-import { normalizeLook } from "../looks.js";
+import { normalizeLook, itemOf, lockedParts, DRINKS, activeBuff } from "../looks.js";
 import { LOUNGE, STOOLS } from "../scene/bar.js";
 
 const NPCS = [
@@ -185,11 +185,48 @@ export function createDemoBackend() {
     const p = profiles()[id];
     if (!p) return;
     user = { id, email: p.email || null };
-    profile = { ...p, look: normalizeLook(p.look, id) };
+    const look = normalizeLook(p.look);
+    for (const item of lockedParts(look, unlockSet())) look[item.kind] = normalizeLook(null)[item.kind];
+    profile = { buff: null, buff_until: null, streak: 0, last_daily: null, ...p, look };
+    saveProfile(profile);
     writeSession({ id });
     bus.emit("profile", profile);
     bus.emit("auth", user);
     syncMyAgent();
+    const today = new Date().toISOString().slice(0, 10);
+    if (profile.last_daily !== today) {
+      const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+      const streak = profile.last_daily === yesterday ? profile.streak + 1 : 1;
+      profile = { ...profile, streak, last_daily: today };
+      saveProfile(profile);
+      setTimeout(() => earn("daily", 50 + 10 * Math.min(streak - 1, 10), `daily streak, day ${streak}`), 1200);
+    }
+  }
+
+  function unlockSet() {
+    return new Set(user ? load(`demo.unlocks.${user.id}`, []) : []);
+  }
+
+  function ledger() {
+    return load(`demo.ledger.${user.id}`, []);
+  }
+
+  function todayCount(source) {
+    const start = new Date().setUTCHours(0, 0, 0, 0);
+    return ledger().filter((e) => e.source === source && e.at >= start);
+  }
+
+  function earn(source, amount, label) {
+    if (!user || amount <= 0) return;
+    const list = ledger();
+    list.push({ source, amount, at: Date.now() });
+    save(`demo.ledger.${user.id}`, list.slice(-400));
+    updateChips(amount);
+    bus.emit("earned", { source, amount, label });
+  }
+
+  function buffEffect() {
+    return activeBuff(profile)?.effect;
   }
 
   function syncMyAgent() {
@@ -217,6 +254,12 @@ export function createDemoBackend() {
 
   sim.on("turnEnd", (ev) => {
     if (!user) return;
+    if (ev.ownerId === user.id && ev.duration >= 15) {
+      const jobs = load(`demo.jobs.${user.id}`, []);
+      jobs.push(Date.now());
+      save(`demo.jobs.${user.id}`, jobs.slice(-200));
+      if (todayCount("job").length < 20) earn("job", buffEffect() === "fresh" ? 20 : 10, "your agent shipped a job");
+    }
     const bets = myBets();
     let touched = false;
     for (const b of bets) {
@@ -232,7 +275,7 @@ export function createDemoBackend() {
         odds = 2;
       }
       b.status = won ? "won" : "lost";
-      b.payout = won ? b.amount * odds : 0;
+      b.payout = won ? Math.floor(b.amount * odds * (b.boost || 1)) : 0;
       touched = true;
       if (won) updateChips(b.payout);
       bus.emit("settled", b);
@@ -497,6 +540,7 @@ export function createDemoBackend() {
       bets.unshift({
         id: randomHex(4), bettor_id: user.id, owner_id: ownerId, owner_handle: owner?.handle || "?", session_key: sessionKey,
         turn_no: a.turn_no, pick: pickName, amount, payout: null, status: "open", created_at: new Date().toISOString(),
+        boost: buffEffect() === "lucky" ? 1.5 : 1,
       });
       saveBets(bets);
       bus.emit("bets");
@@ -522,6 +566,51 @@ export function createDemoBackend() {
       const list = load(key, null) ?? [{ handle: "neon_nina", score: 141 }, { handle: "vapor_vic", score: 96 }, { handle: "glitch_gus", score: 60 }];
       list.push({ handle: profile.handle, score });
       save(key, list);
+      const sofar = todayCount("darts").reduce((s, e) => s + e.amount, 0);
+      earn("darts", Math.min(Math.floor(score / 10), 50 - sofar), `darts game: ${score} points`);
+    },
+
+    async unlocks() {
+      return unlockSet();
+    },
+
+    async buyItem(kind, value) {
+      const item = itemOf(kind, value);
+      if (!item) throw new Error("that isn't for sale");
+      const owned = unlockSet();
+      if (item.price === 0 || owned.has(`${kind}:${value}`)) return { ok: true, chips: profile.chips };
+      if (profile.chips < item.price) throw new Error(`not enough chips for ${item.name}`);
+      owned.add(`${kind}:${value}`);
+      save(`demo.unlocks.${user.id}`, [...owned]);
+      updateChips(-item.price);
+      return { ok: true, chips: profile.chips };
+    },
+
+    async orderDrink(id) {
+      const d = DRINKS[id];
+      if (!d) throw new Error("the bartender has never heard of that one");
+      if (profile.chips < d.price) throw new Error(`not enough chips for a ${d.name}`);
+      const buff_until = new Date(Date.now() + d.minutes * 60000).toISOString();
+      profile = { ...profile, chips: profile.chips - d.price, buff: id, buff_until };
+      saveProfile(profile);
+      bus.emit("profile", profile);
+      return { chips: profile.chips, buff: id, buff_until };
+    },
+
+    async leaderboard(lobbyId) {
+      const def = allLobbies().find((l) => l.id === lobbyId);
+      const weekAgo = Date.now() - 7 * 86400000;
+      const mine = {
+        id: user.id, handle: profile.handle, look: profile.look,
+        jobs: load(`demo.jobs.${user.id}`, []).filter((t) => t >= weekAgo).length,
+        earned: ledger().filter((e) => e.at >= weekAgo && ["job", "hangout", "daily", "darts"].includes(e.source)).reduce((s, e) => s + e.amount, 0),
+      };
+      const npcs = (def?.npcs || ["npc-vic", "npc-nina", "npc-sol"]).map((id, i) => {
+        const n = NPC_BY_ID.get(id);
+        const seed = [...id].reduce((s, c) => s + c.charCodeAt(0), 0);
+        return { id, handle: n.handle, look: normalizeLook(n.look), jobs: 4 + ((seed * 7 + i) % 15), earned: 120 + ((seed * 13) % 420) };
+      });
+      return [mine, ...npcs].sort((a, b) => b.jobs - a.jobs || b.earned - a.earned);
     },
 
     async topScores(game, lobbyId) {
@@ -549,7 +638,13 @@ export function createDemoBackend() {
         peers.set(id, { id, handle: n.handle, look: normalizeLook(n.look, id), x: spot.x + rand(-6, 6), y: spot.y - 6 + rand(-4, 4) });
       }
 
-      const me = () => ({ id: user.id, handle: profile.handle, look: profile.look, x: pos.x, y: pos.y });
+      const me = () => ({ id: user.id, handle: profile.handle, look: profile.look, x: pos.x, y: pos.y, buff: profile.buff, buffUntil: profile.buff_until });
+      let presentSince = Date.now();
+      timers.push(setInterval(() => {
+        if (Date.now() - presentSince < 600000) return;
+        presentSince = Date.now();
+        if (todayCount("hangout").length < 12) earn("hangout", buffEffect() === "island" ? 10 : 5, "hanging out");
+      }, 15000));
       const emitPeers = () => emitter.emit("peers", [me(), ...peers.values(), ...[...remote.values()].map((r) => r.peer)]);
       const visibleOwners = () => new Set([user.id, ...peers.keys(), ...remote.keys()]);
       const emitAgents = () => {
@@ -588,7 +683,17 @@ export function createDemoBackend() {
           emitter.emit("move", { id, x: p.x, y: p.y });
         }, 6500));
         timers.push(setInterval(() => npcSay(pick(npcIds), pick(LINES.general)), 31000));
-        timers.push(setInterval(() => emitter.emit("emote", { id: pick(npcIds), kind: pick(["wave", "cheer", "dance", "drink", "laugh"]) }), 17000));
+        timers.push(setInterval(() => {
+          const id = pick(npcIds);
+          const kind = pick(["wave", "cheer", "dance", "drink", "laugh"]);
+          if (kind === "drink") {
+            const p = peers.get(id);
+            p.buff = pick(Object.keys(DRINKS));
+            p.buffUntil = new Date(Date.now() + 180000).toISOString();
+            emitPeers();
+          }
+          emitter.emit("emote", { id, kind });
+        }, 17000));
       }
 
       const offs = [
