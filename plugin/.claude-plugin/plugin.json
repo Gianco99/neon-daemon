@@ -1,0 +1,6 @@
+{
+  "name": "neon-daemon",
+  "version": "0.1.0",
+  "description": "Sends your Claude Code agent's state (working, needs you, idle) to the NEON DAEMON bar so friends see your drone. Never prompts, code, or paths.",
+  "types": "./types/index.d.ts"
+}

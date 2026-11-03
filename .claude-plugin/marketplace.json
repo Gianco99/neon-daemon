@@ -1,0 +1,14 @@
+{
+  "name": "neon-daemon",
+  "owner": {
+    "name": "NEON DAEMON"
+  },
+  "description": "The Claude Code plugin for the NEON DAEMON bar.",
+  "plugins": [
+    {
+      "name": "neon-daemon",
+      "source": "./plugin",
+      "description": "Sends your Claude Code agent's state (working, needs you, idle) to the NEON DAEMON bar so friends see your drone. Never prompts, code, or paths."
+    }
+  ]
+}
